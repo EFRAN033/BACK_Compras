@@ -784,3 +784,25 @@ async def get_all_products(
         product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
     
     return products
+
+@app.get("/productos/{product_id}", response_model=ProductoProveedorResponse, tags=["Productos Públicos"])
+async def get_product_by_id(
+    product_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Obtiene los detalles de un producto específico por su ID.
+    Solo retorna productos con estado 'Activo'.
+    """
+    product = db.query(models.ProductoProveedor).filter(
+        models.ProductoProveedor.id == product_id,
+        models.ProductoProveedor.estado == 'Activo' # Solo productos activos para el público
+    ).first()
+
+    if not product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado o no disponible.")
+    
+    # Procesar los precios_por_volumen para la respuesta
+    product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
+    
+    return product
