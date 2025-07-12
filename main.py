@@ -7,8 +7,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-# CAMBIO CLAVE: Importar 'joinedload' de sqlalchemy.orm
-from sqlalchemy.orm import Session, joinedload # <--- AÑADIDO joinedload
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -24,12 +23,13 @@ import json
 
 import models
 from database import SessionLocal, engine
-from models import Administrador, SolicitudProveedor, Categoria, Cliente
+from models import Administrador, SolicitudProveedor, Categoria, Cliente, Notificacion # <-- Importar Notificacion
 
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
+# Asegurarse de que las tablas existan (incluida Notificacion)
 models.Base.metadata.create_all(bind=engine)
 
 # --- CONFIGURACIÓN DE SEGURIDAD ---
@@ -280,27 +280,23 @@ class ProductoProveedorResponse(ProductoProveedorBase):
             Decimal: lambda v: float(v)
         }
 
-# NUEVO MODELO PYDANTIC para los detalles del proveedor a incluir en la respuesta del producto
+# Modelo Pydantic para los detalles del proveedor a incluir en la respuesta del producto
 class ProveedorDetalleProducto(BaseModel):
     id: int
     nombre_empresa: str
     email_contacto: EmailStr
     telefono_principal: str
-    # Puedes añadir más campos del proveedor aquí si los necesitas, ej:
-    # rfc: str
-    # anios_experiencia: int
 
     class Config:
         from_attributes = True
 
-# NUEVO MODELO DE RESPUESTA DETALLADA DEL PRODUCTO que incluye los datos del proveedor
+# Modelo de respuesta detallada del producto que incluye los datos del proveedor
 class ProductoProveedorResponseDetallada(ProductoProveedorBase):
     id: int
     proveedor_id: int
     fecha_creacion: datetime
     fecha_actualizacion: datetime
     precios_por_volumen: List[PrecioPorVolumen] = []
-    # CAMBIO CLAVE: Campo opcional para los detalles del proveedor
     proveedor: Optional[ProveedorDetalleProducto] = None
 
     class Config:
@@ -318,6 +314,28 @@ class CategoriaResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+# --- NUEVOS MODELOS PYDANTIC PARA NOTIFICACIONES ---
+class NotificacionCreate(BaseModel):
+    producto_id: int
+    cantidad_deseada: int
+    # Puedes añadir más campos del cliente si lo necesitas o un mensaje personalizado
+
+class NotificacionResponse(BaseModel):
+    id: int
+    proveedor_id: int
+    tipo: str
+    asunto: str
+    cuerpo: str
+    datos_extra: Optional[str] = None
+    leida: bool
+    fecha_creacion: datetime
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            datetime: lambda v: v.isoformat() if v else None,
+        }
 
 # --- INSTANCIA Y CONFIGURACIÓN DE FASTAPI ---
 app = FastAPI(title="ProVeo API", version="1.0.0")
@@ -591,8 +609,8 @@ async def upload_image(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al subir la imagen: {str(e)}")
 
-# MODIFICADO: Endpoint público para obtener productos por ID, ahora devuelve ProductoProveedorResponseDetallada
-@app.get("/productos/{product_id}", response_model=ProductoProveedorResponseDetallada, tags=["Productos Públicos"]) # CAMBIO CLAVE: Usa el modelo detallado
+# Endpoint público para obtener productos por ID, ahora devuelve ProductoProveedorResponseDetallada
+@app.get("/productos/{product_id}", response_model=ProductoProveedorResponseDetallada, tags=["Productos Públicos"])
 async def get_product_by_id(
     product_id: int,
     db: Session = Depends(get_db)
@@ -601,9 +619,8 @@ async def get_product_by_id(
     Obtiene los detalles de un producto específico por su ID, incluyendo información del proveedor.
     Solo retorna productos con estado 'Activo'.
     """
-    # CAMBIO CLAVE: Usar joinedload para cargar eager la relación con el proveedor
     product = db.query(models.ProductoProveedor).options(
-        joinedload(models.ProductoProveedor.proveedor) # <--- joinedload para cargar el proveedor
+        joinedload(models.ProductoProveedor.proveedor)
     ).filter(
         models.ProductoProveedor.id == product_id,
         models.ProductoProveedor.estado == 'Activo'
@@ -621,6 +638,9 @@ async def get_all_products(
     categoria_id: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
+    """
+    Obtiene una lista de todos los productos disponibles, opcionalmente filtrados por categoría.
+    """
     query = db.query(models.ProductoProveedor).filter(models.ProductoProveedor.estado == 'Activo')
     
     if categoria_id:
@@ -633,6 +653,106 @@ async def get_all_products(
     
     return products
 
+# --- ENDPOINTS PARA NOTIFICACIONES ---
+
+@app.post("/notificaciones/solicitar-inventario", status_code=status.HTTP_202_ACCEPTED, tags=["Notificaciones", "Clientes"])
+async def solicitar_llenado_inventario(
+    request_data: NotificacionCreate,
+    db: Session = Depends(get_db),
+    current_client: models.Cliente = Depends(get_current_user_with_role("afiliado"))
+):
+    producto = db.query(models.ProductoProveedor).filter(models.ProductoProveedor.id == request_data.producto_id).first()
+    if not producto:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado.")
+
+    asunto_notificacion = f"Solicitud de Inventario: '{producto.nombre}' de {current_client.razon_social_empresa}"
+    cuerpo_notificacion = (
+        f"El cliente '{current_client.razon_social_empresa}' (ID: {current_client.id}) "
+        f"ha solicitado reponer el inventario del producto '{producto.nombre}' (SKU: {producto.sku}). "
+        f"Cantidad deseada: {request_data.cantidad_deseada} {producto.unidad_medida}. "
+        "Por favor, revisa tu gestión de productos para actualizar el stock."
+    )
+    
+    datos_extra = json.dumps({
+        "product_id": producto.id,
+        "product_name": producto.nombre,
+        "client_id": current_client.id,
+        "client_name": current_client.razon_social_empresa,
+        "requested_quantity": request_data.cantidad_deseada,
+    })
+
+    notificacion = models.Notificacion(
+        proveedor_id=producto.proveedor_id,
+        tipo="solicitud_inventario",
+        asunto=asunto_notificacion,
+        cuerpo=cuerpo_notificacion,
+        datos_extra=datos_extra,
+        leida=False,
+    )
+
+    try:
+        db.add(notificacion)
+        db.commit()
+        db.refresh(notificacion)
+        return {"message": "Solicitud de llenado de inventario enviada al proveedor.", "notification_id": notificacion.id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al enviar la notificación: {str(e)}")
+
+@app.get("/proveedores/notificaciones", response_model=List[NotificacionResponse], tags=["Notificaciones", "Proveedores"])
+async def get_proveedor_notificaciones(
+    db: Session = Depends(get_db),
+    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor")),
+):
+    query = db.query(models.Notificacion).filter(models.Notificacion.proveedor_id == current_supplier.id)
+    notificaciones = query.order_by(models.Notificacion.fecha_creacion.desc()).all()
+    return notificaciones
+
+@app.put("/proveedores/notificaciones/{notification_id}/leer", status_code=status.HTTP_200_OK, tags=["Notificaciones", "Proveedores"])
+async def mark_notification_as_read(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
+):
+    notificacion = db.query(models.Notificacion).filter(
+        models.Notificacion.id == notification_id,
+        models.Notificacion.proveedor_id == current_supplier.id
+    ).first()
+
+    if not notificacion:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notificación no encontrada o no pertenece a este proveedor.")
+    
+    notificacion.leida = True
+    try:
+        db.add(notificacion)
+        db.commit()
+        db.refresh(notificacion)
+        return {"message": "Notificación marcada como leída."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al marcar como leída: {str(e)}")
+
+@app.delete("/proveedores/notificaciones/{notification_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Notificaciones", "Proveedores"])
+async def delete_notification(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
+):
+    notificacion = db.query(models.Notificacion).filter(
+        models.Notificacion.id == notification_id,
+        models.Notificacion.proveedor_id == current_supplier.id
+    ).first()
+
+    if not notificacion:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notificación no encontrada o no pertenece a este proveedor.")
+    
+    try:
+        db.delete(notificacion)
+        db.commit()
+        return {"message": "Notificación eliminada."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al eliminar notificación: {str(e)}")
 
 @app.post("/admin/login", response_model=Token, tags=["Administradores"])
 def login_admin(form_data: AdminLoginRequest, db: Session = Depends(get_db)):
@@ -795,13 +915,13 @@ async def get_all_categories(db: Session = Depends(get_db)):
 
 @app.get("/productos", response_model=List[ProductoProveedorResponse], tags=["Productos Públicos"])
 async def get_all_products(
-    categoria_id: Optional[str] = None, # Permitir filtrar por categoría
+    categoria_id: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """
     Obtiene una lista de todos los productos disponibles, opcionalmente filtrados por categoría.
     """
-    query = db.query(models.ProductoProveedor).filter(models.ProductoProveedor.estado == 'Activo') # Solo productos 'Activo'
+    query = db.query(models.ProductoProveedor).filter(models.ProductoProveedor.estado == 'Activo')
     
     if categoria_id:
         query = query.filter(models.ProductoProveedor.categoria_id == categoria_id)

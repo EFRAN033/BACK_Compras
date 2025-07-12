@@ -1,6 +1,6 @@
 # models.py
 
-from sqlalchemy import Column, Integer, String, Table, ForeignKey, DateTime, Text, Numeric, Date, Boolean # <--- ¡Asegúrate de que 'Boolean' esté aquí!
+from sqlalchemy import Column, Integer, String, Table, ForeignKey, DateTime, Text, Numeric, Date, Boolean # <--- ¡Boolean AÑADIDO aquí!
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import JSONB, ENUM 
@@ -43,7 +43,7 @@ class Cliente(Base):
     tamano_empresa = Column(String)
     contrasena_hash = Column(String)
     fecha_registro = Column(DateTime(timezone=True), server_default=func.now())
-    aceptar_terminos = Column(Boolean, default=True) # This line now has Boolean imported
+    aceptar_terminos = Column(Boolean, default=True)
 
 
 # --- MODELOS PARA PROVEEDORES ---
@@ -76,6 +76,8 @@ class SolicitudProveedor(Base):
     
     # Relación inversa para ProductosProveedor
     productos = relationship("ProductoProveedor", back_populates="proveedor", cascade="all, delete-orphan")
+    # AÑADIDO: Relación inversa para Notificaciones
+    notificaciones = relationship("Notificacion", back_populates="proveedor", cascade="all, delete-orphan")
 
 
 class Categoria(Base):
@@ -144,3 +146,26 @@ class ProductoProveedor(Base):
     # Relaciones con otras tablas
     proveedor = relationship("SolicitudProveedor", back_populates="productos")
     categoria = relationship("Categoria")
+
+# AÑADIDO: Modelo para Notificaciones
+class Notificacion(Base):
+    __tablename__ = "notificaciones"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # ID del proveedor a quien va dirigida la notificación
+    proveedor_id = Column(Integer, ForeignKey('solicitudes_proveedores.id'), nullable=False)
+    # Tipo de notificación (ej. 'nuevo_pedido', 'solicitud_contacto', etc.)
+    tipo = Column(String(50), nullable=False)
+    # Asunto o título de la notificación
+    asunto = Column(String(255), nullable=False)
+    # Cuerpo/contenido de la notificación
+    cuerpo = Column(Text, nullable=False)
+    # Campo para almacenar datos adicionales en formato JSON (ej. ID de producto, cantidad)
+    datos_extra = Column(Text, nullable=True) # Puede ser JSON
+    # Estado de lectura
+    leida = Column(Boolean, default=False)
+    # Fecha de creación
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relación con el proveedor (para obtener el objeto proveedor fácilmente)
+    proveedor = relationship("SolicitudProveedor", back_populates="notificaciones")
