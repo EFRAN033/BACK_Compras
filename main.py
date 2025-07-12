@@ -4,10 +4,11 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File # Added UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
+# CAMBIO CLAVE: Importar 'joinedload' de sqlalchemy.orm
+from sqlalchemy.orm import Session, joinedload # <--- AÑADIDO joinedload
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -25,7 +26,6 @@ import models
 from database import SessionLocal, engine
 from models import Administrador, SolicitudProveedor, Categoria, Cliente
 
-# NEW: Import StaticFiles for serving static files (like uploaded images)
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
@@ -197,10 +197,9 @@ def get_current_user_with_role(required_role: str):
         elif user_role == "afiliado":
             user = db.query(models.Cliente).filter(models.Cliente.email_corporativo == email).first()
         elif user_role == "proveedor":
-            # Si el token es de proveedor, busca en SolicitudProveedor
             user = db.query(models.SolicitudProveedor).filter(
                 models.SolicitudProveedor.email_contacto == email,
-                models.SolicitudProveedor.estado == 'aprobado' # Solo si está aprobado
+                models.SolicitudProveedor.estado == 'aprobado'
             ).first()
         else:
             user = None
@@ -281,6 +280,37 @@ class ProductoProveedorResponse(ProductoProveedorBase):
             Decimal: lambda v: float(v)
         }
 
+# NUEVO MODELO PYDANTIC para los detalles del proveedor a incluir en la respuesta del producto
+class ProveedorDetalleProducto(BaseModel):
+    id: int
+    nombre_empresa: str
+    email_contacto: EmailStr
+    telefono_principal: str
+    # Puedes añadir más campos del proveedor aquí si los necesitas, ej:
+    # rfc: str
+    # anios_experiencia: int
+
+    class Config:
+        from_attributes = True
+
+# NUEVO MODELO DE RESPUESTA DETALLADA DEL PRODUCTO que incluye los datos del proveedor
+class ProductoProveedorResponseDetallada(ProductoProveedorBase):
+    id: int
+    proveedor_id: int
+    fecha_creacion: datetime
+    fecha_actualizacion: datetime
+    precios_por_volumen: List[PrecioPorVolumen] = []
+    # CAMBIO CLAVE: Campo opcional para los detalles del proveedor
+    proveedor: Optional[ProveedorDetalleProducto] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            date: lambda v: v.isoformat() if v else None,
+            datetime: lambda v: v.isoformat() if v else None,
+            Decimal: lambda v: float(v)
+        }
+
 # --- MODELO PYDANTIC para Categoría (Respuesta) ---
 class CategoriaResponse(BaseModel):
     id: str
@@ -293,16 +323,7 @@ class CategoriaResponse(BaseModel):
 app = FastAPI(title="ProVeo API", version="1.0.0")
 
 # MONTAR EL DIRECTORIO ESTÁTICO PARA IMÁGENES
-# Asegúrate de que exista una carpeta 'static' en la raíz de tu proyecto backend
-# Y dentro de 'static', una carpeta 'images'.
-# Ejemplo de estructura:
-# tu_proyecto_backend/
-# ├── main.py
-# ├── models.py
-# ├── static/
-# │   └── images/
-# └── ...
-app.mount("/static", StaticFiles(directory="static"), name="static") # Added Static Files mounting
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -387,11 +408,8 @@ def registrar_solicitud_proveedor(solicitud: SolicitudProveedorCreate, db: Sessi
     
     return {"message": "Solicitud de registro enviada con éxito. Nuestro equipo la revisará pronto."}
 
-# --- NUEVO ENDPOINT: Login para Proveedores ---
 @app.post("/proveedors/login", response_model=Token, tags=["Proveedores"])
 def login_proveedor(form_data: LoginRequest, db: Session = Depends(get_db)):
-    # Busca al proveedor en la tabla solicitudes_proveedores por email_contacto
-    # Solo los proveedores con estado 'aprobado' pueden iniciar sesión
     proveedor_db = db.query(models.SolicitudProveedor).filter(
         models.SolicitudProveedor.email_contacto == form_data.email,
         models.SolicitudProveedor.estado == 'aprobado'
@@ -404,24 +422,20 @@ def login_proveedor(form_data: LoginRequest, db: Session = Depends(get_db)):
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Crea un token de acceso con el rol 'proveedor'
     access_token = create_access_token(data={"sub": proveedor_db.email_contacto, "role": "proveedor"})
     
-    # Devuelve el token y el nombre del contacto del proveedor, incluyendo el rol
     return {
         "token": access_token,
         "user_name": proveedor_db.nombre_contacto,
         "user_role": "proveedor"
     }
 
-# --- INICIO DE ENDPOINTS DE GESTIÓN DE PRODUCTOS PARA PROVEEDORES ---
 @app.post("/proveedores/productos", response_model=ProductoProveedorResponse, status_code=status.HTTP_201_CREATED, tags=["Proveedores", "Productos"])
 async def create_product_for_supplier(
     product: ProductoProveedorCreate,
     db: Session = Depends(get_db),
     current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
 ):
-    # Verificar si la categoría existe
     categoria_exists = db.query(models.Categoria).filter(models.Categoria.id == product.categoria_id).first()
     if not categoria_exists:
         raise HTTPException(
@@ -429,7 +443,6 @@ async def create_product_for_supplier(
             detail=f"La categoría '{product.categoria_id}' no existe."
         )
 
-    # Convertir List[PrecioPorVolumen] a JSONB string
     precios_por_volumen_json = json.dumps([p.dict() for p in product.precios_por_volumen]) if product.precios_por_volumen else "[]"
 
 
@@ -553,28 +566,6 @@ async def update_supplier_product(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error inesperado al actualizar el producto: {str(e)}")
 
-@app.delete("/proveedores/productos/{product_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Proveedores", "Productos"])
-async def delete_supplier_product(
-    product_id: int,
-    db: Session = Depends(get_db),
-    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
-):
-    db_product = db.query(models.ProductoProveedor).filter(
-        models.ProductoProveedor.id == product_id,
-        models.ProductoProveedor.proveedor_id == current_supplier.id
-    ).first()
-
-    if not db_product:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado o no pertenece a este proveedor.")
-
-    try:
-        db.delete(db_product)
-        db.commit()
-        return {"message": "Producto eliminado con éxito."}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al eliminar el producto: {str(e)}")
-
 # --- FIN DE ENDPOINTS DE GESTIÓN DE PRODUCTOS PARA PROVEEDORES ---
 
 # --- NUEVO ENDPOINT PARA SUBIR IMÁGENES ---
@@ -600,6 +591,49 @@ async def upload_image(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al subir la imagen: {str(e)}")
 
+# MODIFICADO: Endpoint público para obtener productos por ID, ahora devuelve ProductoProveedorResponseDetallada
+@app.get("/productos/{product_id}", response_model=ProductoProveedorResponseDetallada, tags=["Productos Públicos"]) # CAMBIO CLAVE: Usa el modelo detallado
+async def get_product_by_id(
+    product_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Obtiene los detalles de un producto específico por su ID, incluyendo información del proveedor.
+    Solo retorna productos con estado 'Activo'.
+    """
+    # CAMBIO CLAVE: Usar joinedload para cargar eager la relación con el proveedor
+    product = db.query(models.ProductoProveedor).options(
+        joinedload(models.ProductoProveedor.proveedor) # <--- joinedload para cargar el proveedor
+    ).filter(
+        models.ProductoProveedor.id == product_id,
+        models.ProductoProveedor.estado == 'Activo'
+    ).first()
+
+    if not product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado o no disponible.")
+    
+    product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
+    
+    return product
+
+@app.get("/productos", response_model=List[ProductoProveedorResponse], tags=["Productos Públicos"])
+async def get_all_products(
+    categoria_id: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(models.ProductoProveedor).filter(models.ProductoProveedor.estado == 'Activo')
+    
+    if categoria_id:
+        query = query.filter(models.ProductoProveedor.categoria_id == categoria_id)
+        
+    products = query.all()
+    
+    for product in products:
+        product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
+    
+    return products
+
+
 @app.post("/admin/login", response_model=Token, tags=["Administradores"])
 def login_admin(form_data: AdminLoginRequest, db: Session = Depends(get_db)):
     admin_db = db.query(Administrador).filter(Administrador.email == form_data.email).first()
@@ -618,8 +652,6 @@ def login_admin(form_data: AdminLoginRequest, db: Session = Depends(get_db)):
         "user_name": f"{admin_db.nombre} {admin_db.apellido}",
         "user_role": "admin"
     }
-
-# --- ENDPOINTS PARA LA GESTIÓN DE PROVEEDORES POR EL ADMINISTRADOR ---
 
 @app.get("/admin/proveedores/solicitudes/pendientes", response_model=List[SolicitudProveedorResponse], tags=["Administradores", "Proveedores"])
 def get_pending_supplier_applications(
@@ -652,7 +684,6 @@ def get_pending_supplier_applications(
         )
     return response_data
 
-# Función para enviar un correo electrónico real usando FastMail
 async def send_welcome_email_task(email_to: str, subject: str, body: str):
     message = MessageSchema(
         subject=subject,
@@ -743,8 +774,8 @@ def reject_supplier_application(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La solicitud ya no está pendiente.")
 
     solicitud.estado = 'rechazado'
-    solicitud.contrasena_hash = None # Limpiar contraseña si se rechaza
-
+    solicitud.contrasena_hash = None
+    
     try:
         db.add(solicitud)
         db.commit()
@@ -762,8 +793,6 @@ async def get_all_categories(db: Session = Depends(get_db)):
     categorias = db.query(models.Categoria).all()
     return categorias
 
-# main.py (Añade esto en una sección lógica, por ejemplo, junto a /categorias o en una nueva sección "Productos Públicos")
-
 @app.get("/productos", response_model=List[ProductoProveedorResponse], tags=["Productos Públicos"])
 async def get_all_products(
     categoria_id: Optional[str] = None, # Permitir filtrar por categoría
@@ -779,30 +808,7 @@ async def get_all_products(
         
     products = query.all()
     
-    # Procesar los precios_por_volumen para la respuesta (si son JSONB)
     for product in products:
         product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
     
     return products
-
-@app.get("/productos/{product_id}", response_model=ProductoProveedorResponse, tags=["Productos Públicos"])
-async def get_product_by_id(
-    product_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Obtiene los detalles de un producto específico por su ID.
-    Solo retorna productos con estado 'Activo'.
-    """
-    product = db.query(models.ProductoProveedor).filter(
-        models.ProductoProveedor.id == product_id,
-        models.ProductoProveedor.estado == 'Activo' # Solo productos activos para el público
-    ).first()
-
-    if not product:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado o no disponible.")
-    
-    # Procesar los precios_por_volumen para la respuesta
-    product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
-    
-    return product
