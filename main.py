@@ -1,202 +1,64 @@
-from fastapi import FastAPI, HTTPException, status, Depends, Request, UploadFile, File, Form
+# main.py
+
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
+
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import logging
-from typing import Optional, List, Dict, Any
 from jose import JWTError, jwt
-from datetime import datetime, timedelta
+import secrets
+from dotenv import load_dotenv
+# --- Enum para el estado del producto (debe coincidir con tu DB) ---
+from enum import Enum
 
-# Asegúrate de que database.py y config.py estén en el mismo directorio o accesibles
-from database import get_db_connection
-from config import settings
+from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
+from decimal import Decimal
+from datetime import date # Importar date para fecha_caducidad
+import json # Importar json para manejar JSONB
+import models
+from database import SessionLocal, engine
+from models import Administrador, SolicitudProveedor, Categoria, Cliente
 
-# Importa la función del chatbot de proveedores
-from chatbot_proveedor import responder_chatbot_proveedor # <-- Importación correcta
+load_dotenv()
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+# --- CONFIGURACIÓN DE SEGURIDAD ---
+SECRET_KEY = os.getenv("SECRET_KEY", "tu_super_secreto_para_jwt_en_dev")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 
-# Configurar CORS
-origins = [
-    "http://localhost:8080", # Tu frontend Vue si lo ejecutas con Vite/Vue CLI development server
-    "http://localhost:5173", # Otro puerto común para Vite/Vue CLI
-    # Agrega aquí la URL de tu frontend en producción (ej. "https://tu-app-frontend.com")
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"], # Permite todos los métodos (GET, POST, PUT, DELETE, etc.)
-    allow_headers=["*"], # Permite todos los headers, incluyendo Content-Type y Authorization
+# --- CONFIGURACIÓN DE CORREO ELECTRÓNICO ---
+conf = ConnectionConfig(
+    MAIL_USERNAME=os.getenv("MAIL_USERNAME"),
+    MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),
+    MAIL_FROM=os.getenv("MAIL_FROM"),
+    MAIL_PORT=int(os.getenv("MAIL_PORT")),
+    MAIL_SERVER=os.getenv("MAIL_SERVER"),
+    MAIL_STARTTLS=True,
+    MAIL_SSL_TLS=False,
+    USE_CREDENTIALS=True,
+    VALIDATE_CERTS=True
 )
 
-# Para hash de contraseñas
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# --- MODELOS DE DATOS (PYDANTIC) ---
+class ClienteUpdate(BaseModel):
+    nombres: Optional[str] = None
+    apellidos: Optional[str] = None
+    email_corporativo: Optional[EmailStr] = None
+    telefono_contacto: Optional[str] = None
+    puesto_cargo: Optional[str] = None
+    razon_social_empresa: Optional[str] = None
+    industria_sector: Optional[str] = None
+    tamano_empresa: Optional[str] = None
 
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-# --- Configuración de JWT ---
-SECRET_KEY = settings.JWT_SECRET_KEY
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # Token expira en 24 horas
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-# --- Dependencia para obtener el usuario actual desde el token (Afiliado) ---
-async def get_current_afiliado(request: Request):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="No se pudieron validar las credenciales de afiliado",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-    token: str = request.headers.get("Authorization")
-    if not token or not token.startswith("Bearer "):
-        raise credentials_exception
-
-    token = token.split(" ")[1] # Extrae el token "real"
-
-    conn = None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("No se pudo establecer conexión con la base de datos para obtener afiliado actual.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error al conectar con la base de datos"
-            )
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM afiliados WHERE email_corporativo = %s;", (email,))
-        afiliado_data = cursor.fetchone()
-        cursor.close()
-
-        if afiliado_data is None:
-            raise credentials_exception
-
-        if not afiliado_data.get("activo"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tu cuenta de afiliado está inactiva."
-            )
-
-        return afiliado_data # Devuelve el diccionario con los datos del afiliado
-    except JWTError as e:
-        logger.error(f"Error de JWT al validar token de afiliado: {e}", exc_info=True)
-        raise credentials_exception
-    except Exception as e:
-        logger.error(f"Error inesperado al obtener afiliado actual: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error interno del servidor al autenticar afiliado."
-        )
-    finally:
-        if conn:
-            conn.close()
-
-# --- Dependencia para obtener el proveedor actual desde el token ---
-async def get_current_proveedor(request: Request):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="No se pudieron validar las credenciales del proveedor",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-    token_header: str = request.headers.get("Authorization")
-    
-    # --- Depurador en el Backend: Token Inicial del Header ---
-    if token_header:
-        logger.info(f"DEBUG: Encabezado Authorization recibido: '{token_header}'")
-        if not token_header.startswith("Bearer "):
-            logger.warning("DEBUG: El encabezado Authorization no empieza con 'Bearer '.")
-            raise credentials_exception
-        token = token_header.split(" ")[1] # Extrae el token "real"
-        logger.info(f"DEBUG: Token extraído (primeros 20 chars): '{token[:20]}...'")
-        logger.info(f"DEBUG: Longitud del token extraído: {len(token)}")
-    else:
-        logger.warning("DEBUG: Encabezado Authorization ausente en la solicitud.")
-        raise credentials_exception
-
-    conn = None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            logger.warning("DEBUG: Payload del token no contiene 'sub' (email).")
-            raise credentials_exception
-
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("No se pudo establecer conexión con la base de datos para obtener proveedor actual.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error al conectar con la base de datos"
-            )
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM proveedores WHERE email_contacto = %s;", (email,))
-        proveedor_data = cursor.fetchone()
-        cursor.close()
-
-        if proveedor_data is None:
-            logger.warning(f"DEBUG: Proveedor con email '{email}' no encontrado en la DB.")
-            raise credentials_exception
-
-        if not proveedor_data.get("activo"):
-            logger.warning(f"DEBUG: Cuenta de proveedor '{email}' inactiva.")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tu cuenta de proveedor está inactiva. Contacta a soporte."
-            )
-        # Comentado temporalmente para permitir que el chatbot funcione incluso si no está verificado.
-        # Puedes descomentar esta validación si quieres restringir el acceso al chatbot solo a proveedores verificados.
-        # if proveedor_data.get("estado_verificacion") != "verificado":
-        #     logger.warning(f"DEBUG: Cuenta de proveedor '{email}' no verificada. Estado: {proveedor_data.get('estado_verificacion')}")
-        #     raise HTTPException(
-        #         status_code=status.HTTP_403_FORBIDDEN,
-        #         detail="Tu cuenta de proveedor aún no ha sido verificada. Estado actual: " + str(proveedor_data.get("estado_verificacion"))
-        #     )
-        
-        logger.info(f"DEBUG: Autenticación de proveedor '{email}' exitosa.")
-        return proveedor_data # Devuelve el diccionario con los datos del proveedor
-    except JWTError as e:
-        logger.error(f"ERROR: Error de JWT al validar token de proveedor: {e}", exc_info=True)
-        raise credentials_exception
-    except Exception as e:
-        logger.error(f"ERROR: Error inesperado al obtener proveedor actual: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error interno del servidor al autenticar proveedor."
-        )
-    finally:
-        if conn:
-            conn.close()
-
-
-## Modelos Pydantic (Afiliados)
-class AfiliadoRegistro(BaseModel):
+class ClienteCreate(BaseModel):
     nombres: str
     apellidos: str
     email_corporativo: EmailStr
@@ -208,717 +70,484 @@ class AfiliadoRegistro(BaseModel):
     tamano_empresa: str
     contrasena: str
 
-class AfiliadoLogin(BaseModel):
-    email: EmailStr
-    password: str
-
-class AfiliadoResponse(BaseModel):
+class Cliente(BaseModel):
     id: int
     nombres: str
     apellidos: str
     email_corporativo: EmailStr
-    telefono_contacto: Optional[str] = None
-    puesto_cargo: Optional[str] = None
-    razon_social_empresa: Optional[str] = None
-    rfc_empresa: Optional[str] = None
-    industria_sector: Optional[str] = None
-    tamano_empresa: Optional[str] = None
-    activo: bool
-    fecha_creacion: Optional[datetime] = None
-    fecha_actualizacion: Optional[datetime] = None
+    telefono_contacto: str
+    puesto_cargo: str
+    razon_social_empresa: str
+    rfc_empresa: str
+    industria_sector: str
+    tamano_empresa: str
+    
+    class Config:
+        from_attributes = True
 
-class AfiliadoUpdate(BaseModel):
-    nombres: Optional[str] = None
-    apellidos: Optional[str] = None
-    email_corporativo: Optional[EmailStr] = None
-    telefono_contacto: Optional[str] = None
-    puesto_cargo: Optional[str] = None
-    razon_social_empresa: Optional[str] = None
-    rfc_empresa: Optional[str] = None
-    industria_sector: Optional[str] = None
-    tamano_empresa: Optional[str] = None
-    activo: Optional[bool] = None
+class Token(BaseModel):
+    token: str
+    user_name: str
+    user_role: str
 
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
-## Modelos Pydantic (Proveedores)
-class ProveedorRegistro(BaseModel):
+class SolicitudProveedorCreate(BaseModel):
     empresa: str
     rfc: str
     anios: int
-    categorias: List[str] 
+    categorias: List[str]
     nombre: str
     puesto: str
-    email: EmailStr
+    email: str
     telefono: str
     whatsapp: Optional[str] = None
     capacidad: str
     tiempo: str
     certificaciones: Optional[str] = None
-    password: str
 
-class ProveedorLogin(BaseModel):
+class AdminLoginRequest(BaseModel):
     email: EmailStr
     password: str
 
-class ProveedorResponse(BaseModel):
+class AdminUser(BaseModel):
     id: int
-    nombre_legal_empresa: str
-    rfc_empresa: str
-    anos_experiencia: int
-    nombre_completo_contacto: str
-    puesto_cargo_contacto: str
+    email: EmailStr
+    nombre: str
+    apellido: str
+
+    class Config:
+        from_attributes = True
+
+class SolicitudProveedorResponse(BaseModel):
+    id: int
+    nombre_empresa: str
+    rfc: str
+    anios_experiencia: int
+    nombre_contacto: str
+    puesto_contacto: str
     email_contacto: EmailStr
     telefono_principal: str
     whatsapp: Optional[str] = None
-    capacidad_produccion_mensual: str
-    tiempo_entrega_promedio: str
-    certificaciones_calidad: Optional[str] = None
-    fecha_registro: Optional[datetime] = None
-    ultima_sesion: Optional[datetime] = None
-    estado_verificacion: str
-    activo: bool
+    capacidad_mensual: str
+    tiempo_entrega: str
+    certificaciones: Optional[str] = None
+    estado: str
+    fecha_solicitud: datetime
+    categorias: List[dict]
 
-class ProveedorUpdate(BaseModel):
-    nombre_legal_empresa: Optional[str] = None
-    rfc_empresa: Optional[str] = None
-    anos_experiencia: Optional[int] = None
-    nombre_completo_contacto: Optional[str] = None
-    puesto_cargo_contacto: Optional[str] = None
-    email_contacto: Optional[EmailStr] = None
-    telefono_principal: Optional[str] = None
-    whatsapp: Optional[str] = None
-    capacidad_produccion_mensual: Optional[str] = None
-    tiempo_entrega_promedio: Optional[str] = None
-    certificaciones_calidad: Optional[str] = None
-    estado_verificacion: Optional[str] = None 
-    activo: Optional[bool] = None
+    class Config:
+        from_attributes = True
 
-# --- Modelo para el mensaje del chatbot (¡CLAVE PARA EL 422!) ---
-class ChatMessage(BaseModel):
-    message: str # Este es el campo que tu frontend está enviando.
+# --- UTILIDADES DE SEGURIDAD ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/afiliados/login")
 
-# --- Modelo para la respuesta de análisis de contrato (para el futuro) ---
-class ClauseAnalysis(BaseModel):
-    clauseType: str
-    riskLevel: str
-    suggestion: str
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
-## Endpoints Generales
-@app.get("/")
-async def root():
-    return {"message": "API de ProVeo funcionando"}
+def get_password_hash(password: str):
+    return pwd_context.hash(password)
 
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
-## Endpoints de Afiliados
-@app.post("/afiliados/registro")
-async def registrar_afiliado(afiliado: AfiliadoRegistro):
-    logger.debug("Intentando registrar afiliado...")
-    conn = None
+# --- DEPENDENCIAS ---
+def get_db():
+    db = SessionLocal()
     try:
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("No se pudo establecer conexión con la base de datos para registro.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error al conectar con la base de datos"
-            )
-
-        hashed_password = get_password_hash(afiliado.contrasena)
-        logger.debug(f"Contraseña hasheada para {afiliado.email_corporativo}")
-
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO afiliados (
-                nombres, apellidos, email_corporativo, telefono_contacto, puesto_cargo,
-                razon_social_empresa, rfc_empresa, industria_sector, tamano_empresa,
-                contrasena_hash, activo, fecha_creacion, fecha_actualizacion
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
-            """,
-            (
-                afiliado.nombres, afiliado.apellidos, afiliado.email_corporativo,
-                afiliado.telefono_contacto, afiliado.puesto_cargo,
-                afiliado.razon_social_empresa, afiliado.rfc_empresa,
-                afiliado.industria_sector, afiliado.tamano_empresa,
-                hashed_password, True, datetime.utcnow(), datetime.utcnow()
-            )
-        )
-        afiliado_id = cursor.fetchone()[0]
-        conn.commit()
-        logger.info(f"Afiliado registrado exitosamente con ID: {afiliado_id}")
-        return {"message": "Afiliado registrado exitosamente", "id": afiliado_id}
-    except psycopg2.IntegrityError as e:
-        if conn: conn.rollback()
-        logger.error(f"Error de integridad al registrar afiliado: {e}")
-        if "email_corporativo" in str(e) or "rfc_empresa" in str(e):
-             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="El correo electrónico o RFC de la empresa ya están registrados."
-            )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error al registrar afiliado: {e}"
-        )
-    except Exception as e:
-        if conn: conn.rollback()
-        logger.error(f"Error inesperado al registrar afiliado: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor: {e}"
-        )
+        yield db
     finally:
-        if conn:
-            conn.close()
-            logger.debug("Conexión de BD cerrada después del registro.")
+        db.close()
 
-
-@app.post("/afiliados/login")
-async def login_afiliado(afiliado_login: AfiliadoLogin):
-    logger.debug(f"Intento de login para afiliado: {afiliado_login.email}")
-    conn = None
-    try:
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("No se pudo establecer conexión con la base de datos para login.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error al conectar con la base de datos"
-            )
-
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        logger.debug(f"Consultando afiliado con email: {afiliado_login.email}")
-        cursor.execute(
-            "SELECT id, contrasena_hash, activo, nombres, apellidos, razon_social_empresa, email_corporativo FROM afiliados WHERE email_corporativo = %s;",
-            (afiliado_login.email,)
+def get_current_user_with_role(required_role: str):
+    def _get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+        credentials_exception = HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No se pudieron validar las credenciales",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-        afiliado_data = cursor.fetchone()
-        cursor.close()
-        logger.debug(f"Datos de afiliado obtenidos: {afiliado_data}")
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            email: str = payload.get("sub")
+            user_role: str = payload.get("role")
 
-        if not afiliado_data:
-            logger.warning(f"Intento de login fallido: usuario {afiliado_login.email} no encontrado.")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Credenciales inválidas"
-            )
-
-        hashed_password = afiliado_data["contrasena_hash"]
-        activo = afiliado_data["activo"]
-
-        logger.debug(f"Verificando contraseña para {afiliado_login.email}")
-        if not verify_password(afiliado_login.password, hashed_password):
-            logger.warning(f"Intento de login fallido: contraseña incorrecta para {afiliado_login.email}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Credenciales inválidas"
-            )
-
-        if not activo:
-            logger.warning(f"Intento de login fallido: cuenta inactiva para {afiliado_login.email}")
+            if email is None or user_role is None:
+                raise credentials_exception
+        except JWTError:
+            raise credentials_exception
+        
+        if user_role != required_role:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cuenta inactiva. Por favor, contacta a soporte."
+                detail=f"No tiene permisos para acceder a este recurso. Rol requerido: '{required_role}', Rol del usuario: '{user_role}'",
             )
 
-        user_display_name = afiliado_data.get("razon_social_empresa") or f"{afiliado_data['nombres']} {afiliado_data['apellidos']}"
-        logger.info(f"Login exitoso para afiliado: {user_display_name} (ID: {afiliado_data['id']})")
+        if user_role == "admin":
+            user = db.query(Administrador).filter(Administrador.email == email).first()
+        elif user_role == "afiliado":
+            user = db.query(models.Cliente).filter(models.Cliente.email_corporativo == email).first()
+        elif user_role == "proveedor":
+            # Si el token es de proveedor, busca en SolicitudProveedor
+            user = db.query(models.SolicitudProveedor).filter(
+                models.SolicitudProveedor.email_contacto == email,
+                models.SolicitudProveedor.estado == 'aprobado' # Solo si está aprobado
+            ).first()
+        else:
+            user = None
 
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": afiliado_data["email_corporativo"]},
-            expires_delta=access_token_expires
-        )
+        if user is None:
+            raise credentials_exception
+        return user
+    return _get_current_user
 
-        return {
-            "message": "Inicio de sesión exitoso",
-            "afiliado_id": afiliado_data["id"],
-            "user_name": user_display_name,
-            "token": access_token,
-            "email": afiliado_data["email_corporativo"]
+class ProductStatusEnum(str, Enum):
+    activo = "Activo"
+    inactivo = "Inactivo"
+    borrador = "Borrador"
+
+# --- Enum para la unidad de medida (debe coincidir con tu DB) ---
+class UnitOfMeasureEnum(str, Enum):
+    unidad = "Unidad"
+    caja = "Caja"
+    paquete = "Paquete"
+    kg = "Kg"
+    ltr = "Ltr"
+    docena = "Docena"
+    bulto = "Bulto"
+    palet = "Palet"
+    servicio = "Servicio" # Añadir si existe en tus datos de ejemplo
+    licencia = "Licencia" # Añadir si existe en tus datos de ejemplo
+    suscripcion = "Suscripción" # Añadir si existe en tus datos de ejemplo
+
+# --- Modelos para Precios por Volumen ---
+class PrecioPorVolumen(BaseModel):
+    min_quantity: int
+    max_quantity: Optional[int] = None
+    price: Decimal
+
+# --- Modelo Base para Producto (para creación/actualización) ---
+class ProductoProveedorBase(BaseModel):
+    nombre: str
+    descripcion: Optional[str] = None
+    precio: Decimal
+    stock: int
+    categoria_id: str # Coincide con 'categoria_id' en tu DB
+    image_url: Optional[str] = None
+    sku: Optional[str] = None
+    estado: ProductStatusEnum = ProductStatusEnum.borrador
+    unidad_medida: UnitOfMeasureEnum = UnitOfMeasureEnum.unidad
+    cantidad_minima_pedido: int = 1
+    precios_por_volumen: Optional[List[PrecioPorVolumen]] = []
+    peso_kg: Optional[Decimal] = None
+    dimension_largo_cm: Optional[Decimal] = None
+    dimension_ancho_cm: Optional[Decimal] = None
+    dimension_alto_cm: Optional[Decimal] = None
+    codigo_barras: Optional[str] = None
+    fecha_caducidad: Optional[date] = None # Usar date
+    tiempo_procesamiento_dias: Optional[int] = None
+
+# --- Modelo para la creación de un producto (entrada) ---
+class ProductoProveedorCreate(ProductoProveedorBase):
+    # No necesita el ID ya que es auto-generado
+    pass
+
+# --- Modelo para la actualización de un producto (entrada, campos opcionales) ---
+class ProductoProveedorUpdate(ProductoProveedorBase):
+    nombre: Optional[str] = None
+    precio: Optional[Decimal] = None
+    stock: Optional[int] = None
+    categoria_id: Optional[str] = None
+    estado: Optional[ProductStatusEnum] = None
+    unidad_medida: Optional[UnitOfMeasureEnum] = None
+    cantidad_minima_pedido: Optional[int] = None
+    # Los demás campos ya son Optional en ProductoProveedorBase
+
+# --- Modelo para la respuesta de un producto (salida, incluye ID y fechas) ---
+class ProductoProveedorResponse(ProductoProveedorBase):
+    id: int
+    proveedor_id: int # Necesitamos el ID del proveedor al que pertenece
+    fecha_creacion: datetime
+    fecha_actualizacion: datetime
+    # Para manejar los precios_por_volumen como lista de dicts si vienen de la DB
+    precios_por_volumen: List[PrecioPorVolumen] = []
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            date: lambda v: v.isoformat() if v else None, # Formatear date a string ISO
+            datetime: lambda v: v.isoformat() if v else None, # Formatear datetime a string ISO
+            Decimal: lambda v: float(v) # Convertir Decimal a float para JSON
         }
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        logger.error(f"Error inesperado en /afiliados/login: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor: {e}. Revisa logs del servidor."
-        )
-    finally:
-        if conn:
-            conn.close()
-            logger.debug("Conexión de BD cerrada después del login.")
 
-## Endpoints de Proveedores
+# --- INSTANCIA Y CONFIGURACIÓN DE FASTAPI ---
+app = FastAPI(title="ProVeo API", version="1.0.0")
+origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-@app.post("/proveedores/registro")
-async def registrar_proveedor(proveedor: ProveedorRegistro):
-    logger.debug("Intentando registrar proveedor...")
-    conn = None
+# --- RUTAS (ENDPOINTS) ---
+
+@app.post("/afiliados/registro", response_model=Cliente, status_code=status.HTTP_201_CREATED, tags=["Clientes"])
+def registrar_cliente(cliente: ClienteCreate, db: Session = Depends(get_db)):
+    hashed_password = get_password_hash(cliente.contrasena)
+    db_cliente = models.Cliente(**cliente.dict(exclude={"contrasena"}), contrasena_hash=hashed_password)
     try:
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("No se pudo establecer conexión con la base de datos para registro de proveedor.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error al conectar con la base de datos"
-            )
+        db.add(db_cliente)
+        db.commit()
+        db.refresh(db_cliente)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El correo electrónico o el RFC ya están registrados.")
+    return db_cliente
 
-        hashed_password = get_password_hash(proveedor.password)
-        logger.debug(f"Contraseña hasheada para {proveedor.email}")
-
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO proveedores (
-                nombre_legal_empresa,
-                rfc_empresa,
-                anos_experiencia,
-                nombre_completo_contacto,
-                puesto_cargo_contacto,
-                email_contacto,
-                telefono_principal,
-                whatsapp,
-                capacidad_produccion_mensual,
-                tiempo_entrega_promedio,
-                certificaciones_calidad,
-                contrasena_hash,
-                fecha_registro,
-                ultima_sesion,
-                estado_verificacion,
-                activo
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            ) RETURNING id;
-            """,
-            (
-                proveedor.empresa,
-                proveedor.rfc,
-                proveedor.anios,
-                proveedor.nombre,
-                proveedor.puesto,
-                proveedor.email,
-                proveedor.telefono,
-                proveedor.whatsapp,
-                proveedor.capacidad,
-                proveedor.tiempo,
-                proveedor.certificaciones,
-                hashed_password,
-                datetime.utcnow(),          # fecha_registro
-                None,                       # ultima_sesion
-                'pendiente',                # estado_verificacion - Nuevo proveedor comienza como pendiente
-                True                        # activo
-            )
-        )
-        proveedor_id = cursor.fetchone()[0]
-
-        # --- Manejo de Categorías ---
-        if proveedor.categorias:
-            for category_name in proveedor.categorias:
-                cursor.execute("SELECT id FROM categorias_generales WHERE nombre_categoria = %s;", (category_name,))
-                category_data = cursor.fetchone()
-                if category_data:
-                    category_id = category_data[0]
-                    cursor.execute(
-                        "INSERT INTO proveedores_categorias (id_proveedor, id_categoria) VALUES (%s, %s);",
-                        (proveedor_id, category_id)
-                    )
-                else:
-                    logger.warning(f"Categoría '{category_name}' no encontrada en la tabla 'categorias_generales'. No se pudo asociar.")
-
-        conn.commit()
-        logger.info(f"Proveedor registrado exitosamente con ID: {proveedor_id}")
-        return {"message": "Proveedor registrado exitosamente", "id": proveedor_id}
-    except psycopg2.IntegrityError as e:
-        if conn: conn.rollback()
-        logger.error(f"Error de integridad al registrar proveedor: {e}", exc_info=True)
-        if "email_contacto" in str(e):
-             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="El correo electrónico de contacto ya está registrado para otro proveedor."
-            )
-        if "rfc_empresa" in str(e):
-             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="El RFC de la empresa ya está registrado para otro proveedor."
-            )
-        if "nombre_legal_empresa" in str(e):
-             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="El nombre legal de la empresa ya está registrado para otro proveedor."
-            )
+@app.post("/afiliados/login", response_model=Token, tags=["Clientes"])
+def login_cliente(form_data: LoginRequest, db: Session = Depends(get_db)):
+    cliente_db = db.query(models.Cliente).filter(models.Cliente.email_corporativo == form_data.email).first()
+    if not cliente_db or not verify_password(form_data.password, cliente_db.contrasena_hash):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error al registrar proveedor: {e}"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Correo electrónico o contraseña incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    except Exception as e:
-        if conn: conn.rollback()
-        logger.error(f"Error inesperado al registrar proveedor: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor: {e}"
-        )
-    finally:
-        if conn:
-            conn.close()
-            logger.debug("Conexión de BD cerrada después del registro de proveedor.")
+    access_token = create_access_token(data={"sub": cliente_db.email_corporativo, "role": "afiliado"})
+    return {"token": access_token, "user_name": cliente_db.nombres, "user_role": "afiliado"}
 
+@app.get("/afiliados/me", response_model=Cliente, tags=["Clientes"])
+def read_users_me(current_user: models.Cliente = Depends(get_current_user_with_role("afiliado"))):
+    return current_user
 
-@app.post("/proveedores/login")
-async def login_proveedor(proveedor_login: ProveedorLogin):
-    logger.debug(f"Intento de login para proveedor: {proveedor_login.email}")
-    conn = None
+@app.patch("/afiliados/me", response_model=Cliente, tags=["Clientes"])
+def update_user_me(user_update: ClienteUpdate, db: Session = Depends(get_db), current_user: models.Cliente = Depends(get_current_user_with_role("afiliado"))):
+    update_data = user_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(current_user, key, value)
     try:
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("No se pudo establecer conexión con la base de datos para login de proveedor.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error al conectar con la base de datos"
-            )
+        db.add(current_user)
+        db.commit()
+        db.refresh(current_user)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El correo electrónico ya está en uso por otra cuenta.")
+    return db_cliente
 
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        logger.debug(f"Consultando proveedor con email: {proveedor_login.email}")
-        cursor.execute(
-            "SELECT id, contrasena_hash, activo, nombre_legal_empresa, email_contacto, estado_verificacion FROM proveedores WHERE email_contacto = %s;",
-            (proveedor_login.email,)
-        )
-        proveedor_data = cursor.fetchone()
-        cursor.close()
-        logger.debug(f"Datos de proveedor obtenidos: {proveedor_data}")
+@app.post("/proveedores/registro", status_code=status.HTTP_201_CREATED, tags=["Proveedores"])
+def registrar_solicitud_proveedor(solicitud: SolicitudProveedorCreate, db: Session = Depends(get_db)):
+    categorias_db = db.query(models.Categoria).filter(models.Categoria.id.in_(solicitud.categorias)).all()
+    if len(categorias_db) != len(solicitud.categorias):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Una o más categorías enviadas no son válidas.")
+    
+    db_solicitud = models.SolicitudProveedor(
+        nombre_empresa=solicitud.empresa,
+        rfc=solicitud.rfc,
+        anios_experiencia=solicitud.anios,
+        nombre_contacto=solicitud.nombre,
+        puesto_contacto=solicitud.puesto,
+        email_contacto=solicitud.email,
+        telefono_principal=solicitud.telefono,
+        whatsapp=solicitud.whatsapp,
+        capacidad_mensual=solicitud.capacidad,
+        tiempo_entrega=solicitud.tiempo,
+        certificaciones=solicitud.certificaciones,
+        estado='pendiente'
+    )
+    
+    for categoria_db in categorias_db:
+        db_solicitud.categorias_asociadas.append(categoria_db)
 
-        if not proveedor_data:
-            logger.warning(f"Intento de login fallido: proveedor {proveedor_login.email} no encontrado.")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Credenciales inválidas"
-            )
+    try:
+        db.add(db_solicitud)
+        db.commit()
+        db.refresh(db_solicitud)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El RFC o el email de contacto ya han sido registrados en una solicitud previa.")
+    
+    return {"message": "Solicitud de registro enviada con éxito. Nuestro equipo la revisará pronto."}
 
-        hashed_password = proveedor_data["contrasena_hash"]
-        activo = proveedor_data["activo"]
-        estado_verificacion = proveedor_data["estado_verificacion"]
+# --- NUEVO ENDPOINT: Login para Proveedores ---
+@app.post("/proveedors/login", response_model=Token, tags=["Proveedores"])
+def login_proveedor(form_data: LoginRequest, db: Session = Depends(get_db)):
+    # Busca al proveedor en la tabla solicitudes_proveedores por email_contacto
+    # Solo los proveedores con estado 'aprobado' pueden iniciar sesión
+    proveedor_db = db.query(models.SolicitudProveedor).filter(
+        models.SolicitudProveedor.email_contacto == form_data.email,
+        models.SolicitudProveedor.estado == 'aprobado'
+    ).first()
 
-        logger.debug(f"Verificando contraseña para {proveedor_login.email}")
-        if not verify_password(proveedor_login.password, hashed_password):
-            logger.warning(f"Intento de login fallido: contraseña incorrecta para {proveedor_login.email}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Credenciales inválidas"
-            )
-
-        if not activo:
-            logger.warning(f"Intento de login fallido: cuenta inactiva para {proveedor_login.email}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cuenta inactiva. Por favor, contacta a soporte."
-            )
-        
-        if estado_verificacion != 'verificado':
-            logger.warning(f"Intento de login fallido: cuenta de proveedor {proveedor_login.email} no verificada ({estado_verificacion}).")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Tu cuenta aún está en proceso de verificación ({estado_verificacion}). Por favor, espera la aprobación."
-            )
-
-
-        user_display_name = proveedor_data.get("nombre_legal_empresa")
-        logger.info(f"Login exitoso para proveedor: {user_display_name} (ID: {proveedor_data['id']})")
-
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": proveedor_data["email_contacto"]}, # 'sub' should be unique identifier like email
-            expires_delta=access_token_expires
-        )
-
-        return {
-            "message": "Inicio de sesión exitoso",
-            "proveedor_id": proveedor_data["id"],
-            "user_name": user_display_name, # Use nombre_legal_empresa for display
-            "token": access_token,
-            "email": proveedor_data["email_contacto"]
-        }
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        logger.error(f"Error inesperado en /proveedores/login: {e}", exc_info=True)
+    if not proveedor_db or not verify_password(form_data.password, proveedor_db.contrasena_hash):
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor: {e}. Revisa logs del servidor."
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales de proveedor incorrectas o cuenta no aprobada",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    finally:
-        if conn:
-            conn.close()
-            logger.debug("Conexión de BD cerrada después del login de proveedor.")
+    
+    # Crea un token de acceso con el rol 'proveedor'
+    access_token = create_access_token(data={"sub": proveedor_db.email_contacto, "role": "proveedor"})
+    
+    # Devuelve el token y el nombre del contacto del proveedor, incluyendo el rol
+    return {
+        "token": access_token,
+        "user_name": proveedor_db.nombre_contacto, # O el nombre de la empresa
+        "user_role": "proveedor"
+    }
 
 
-## Endpoints para el Perfil del Afiliado
-@app.get("/afiliados/me", response_model=AfiliadoResponse)
-async def read_afiliado_me(current_afiliado: dict = Depends(get_current_afiliado)):
-    """
-    Recupera la información del perfil del afiliado autenticado.
-    """
-    return current_afiliado
+@app.post("/admin/login", response_model=Token, tags=["Administradores"])
+def login_admin(form_data: AdminLoginRequest, db: Session = Depends(get_db)):
+    admin_db = db.query(Administrador).filter(Administrador.email == form_data.email).first()
 
-@app.patch("/afiliados/me", response_model=AfiliadoResponse)
-async def update_afiliado_me(
-    afiliado_update: AfiliadoUpdate,
-    current_afiliado: dict = Depends(get_current_afiliado)
+    if not admin_db or not verify_password(form_data.password, admin_db.contrasena_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales de administrador incorrectas",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token = create_access_token(data={"sub": admin_db.email, "role": "admin"})
+    
+    return {
+        "token": access_token,
+        "user_name": f"{admin_db.nombre} {admin_db.apellido}",
+        "user_role": "admin"
+    }
+
+# --- ENDPOINTS PARA LA GESTIÓN DE PROVEEDORES POR EL ADMINISTRADOR ---
+
+@app.get("/admin/proveedores/solicitudes/pendientes", response_model=List[SolicitudProveedorResponse], tags=["Administradores", "Proveedores"])
+def get_pending_supplier_applications(
+    db: Session = Depends(get_db),
+    current_admin_user: Administrador = Depends(get_current_user_with_role("admin"))
 ):
-    """
-    Actualiza la información del perfil del afiliado autenticado.
-    """
-    conn = None
+    solicitudes = db.query(SolicitudProveedor).filter(SolicitudProveedor.estado == 'pendiente').all()
+    
+    response_data = []
+    for s in solicitudes:
+        categorias_data = [{"id": cat.id, "nombre": cat.nombre} for cat in s.categorias_asociadas]
+        response_data.append(
+            SolicitudProveedorResponse(
+                id=s.id,
+                nombre_empresa=s.nombre_empresa,
+                rfc=s.rfc,
+                anios_experiencia=s.anios_experiencia,
+                nombre_contacto=s.nombre_contacto,
+                puesto_contacto=s.puesto_contacto,
+                email_contacto=s.email_contacto,
+                telefono_principal=s.telefono_principal,
+                whatsapp=s.whatsapp,
+                capacidad_mensual=s.capacidad_mensual,
+                tiempo_entrega=s.tiempo_entrega,
+                certificaciones=s.certificaciones,
+                estado=s.estado,
+                fecha_solicitud=s.fecha_solicitud,
+                categorias=categorias_data
+            )
+        )
+    return response_data
+
+# Función para enviar un correo electrónico real usando FastMail
+async def send_welcome_email_task(email_to: str, subject: str, body: str):
+    message = MessageSchema(
+        subject=subject,
+        recipients=[email_to],
+        body=body,
+        subtype="html"
+    )
+    fm = FastMail(conf)
     try:
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("No se pudo establecer conexión con la base de datos para actualización de perfil.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error al conectar con la base de datos"
-            )
+        await fm.send_message(message)
+        print(f"EMAIL ENVIADO: Correo a {email_to} - Asunto: {subject}")
+    except Exception as e:
+        print(f"ERROR AL ENVIAR EMAIL a {email_to}: {e}")
 
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+@app.post("/admin/proveedores/aprobar/{solicitud_id}", tags=["Administradores", "Proveedores"])
+def approve_supplier_application(
+    solicitud_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_admin_user: Administrador = Depends(get_current_user_with_role("admin"))
+):
+    solicitud = db.query(models.SolicitudProveedor).filter(models.SolicitudProveedor.id == solicitud_id).first()
+    if not solicitud:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solicitud de proveedor no encontrada.")
+    if solicitud.estado != 'pendiente':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La solicitud ya no está pendiente.")
 
-        update_fields = []
-        update_values = []
+    temp_password = secrets.token_urlsafe(12)
+    hashed_password = get_password_hash(temp_password)
 
-        for field, value in afiliado_update.model_dump(exclude_unset=True).items():
-            update_fields.append(f"{field} = %s")
-            update_values.append(value)
+    solicitud.estado = 'aprobado'
+    solicitud.contrasena_hash = hashed_password
+    
+    try:
+        db.add(solicitud)
+        db.commit()
+        db.refresh(solicitud)
 
-        if not update_fields:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No se proporcionaron datos para actualizar."
-            )
-
-        update_fields.append("fecha_actualizacion = %s")
-        update_values.append(datetime.utcnow())
-
-        update_values.append(current_afiliado["id"])
-
-        query = f"""
-            UPDATE afiliados
-            SET {", ".join(update_fields)}
-            WHERE id = %s
-            RETURNING *;
+        email_subject = "¡Tu solicitud de proveedor ha sido aprobada en ProVeo!"
+        email_body = f"""
+        <html>
+            <body>
+                <p>Estimado/a(s) {solicitud.nombre_contacto},</p>
+                
+                <p>Es un placer informarte que la solicitud de tu empresa, <strong>{solicitud.nombre_empresa}</strong>, para unirse a nuestra red de proveedores en ProVeo ha sido **APROBADA** con éxito. ¡Estamos muy entusiasmados con tu incorporación!</p>
+                
+                <p>A partir de ahora, ya puedes acceder a nuestra plataforma y comenzar a explorar las oportunidades disponibles. A continuación, te proporcionamos tus credenciales de acceso inicial:</p>
+                
+                <p>
+                    <strong>Usuario (Email):</strong> <code>{solicitud.email_contacto}</code><br>
+                    <strong>Contraseña Temporal:</strong> <code>{temp_password}</code>
+                </p>
+                
+                <p>Por motivos de seguridad, te recomendamos encarecidamente que **cambies esta contraseña temporal** inmediatamente después de tu primer inicio de sesión. Esto garantizará la protección de tu cuenta y la información de tu empresa.</p>
+                
+                <p>Si tienes alguna pregunta o necesitas asistencia durante tus primeros pasos en la plataforma, no dudes en contactar a nuestro equipo de soporte.</p>
+                
+                <p>¡Te damos la más cordial bienvenida a la comunidad de ProVeo y esperamos una colaboración fructífera!</p>
+                
+                <p>Atentamente,</p>
+                <p>El Equipo de ProVeo</p>
+                <br>
+                <hr>
+                <p style="font-size: 0.8em; color: #777;">Este es un mensaje automático. Por favor, no respondas a este correo.</p>
+            </body>
+        </html>
         """
+        background_tasks.add_task(send_welcome_email_task, solicitud.email_contacto, email_subject, email_body)
 
-        logger.debug(f"Ejecutando consulta de actualización: {query} con valores: {update_values}")
-        cursor.execute(query, tuple(update_values))
-
-        updated_afiliado_data = cursor.fetchone()
-        conn.commit()
-        cursor.close()
-
-        if not updated_afiliado_data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Perfil no encontrado o no se pudo actualizar."
-            )
-
-        logger.info(f"Perfil de afiliado {current_afiliado['id']} actualizado exitosamente.")
-        return updated_afiliado_data
-
-    except psycopg2.IntegrityError as e:
-        if conn: conn.rollback()
-        logger.error(f"Error de integridad al actualizar perfil: {e}", exc_info=True)
-        if "email_corporativo" in str(e) or "rfc_empresa" in str(e):
-             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="El correo electrónico o RFC de la empresa ya están registrados por otro usuario."
-            )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error al actualizar perfil: {e}"
-        )
-    except HTTPException as http_exc:
-        raise http_exc
+        return {"message": "Solicitud aprobada y proveedor registrado con éxito. Se envió un correo con la contraseña temporal."}
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error de base de datos al aprobar la solicitud: {e.orig}")
     except Exception as e:
-        if conn: conn.rollback()
-        logger.error(f"Error inesperado al actualizar perfil: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor al actualizar el perfil: {e}"
-        )
-    finally:
-        if conn:
-            conn.close()
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error inesperado al aprobar: {str(e)}")
 
-
-## Nuevos Endpoints para el Perfil del Proveedor
-@app.get("/proveedores/me", response_model=ProveedorResponse)
-async def read_proveedor_me(current_proveedor: dict = Depends(get_current_proveedor)):
-    """
-    Recupera la información del perfil del proveedor autenticado.
-    """
-    return current_proveedor
-
-@app.patch("/proveedores/me", response_model=ProveedorResponse)
-async def update_proveedor_me(
-    proveedor_update: ProveedorUpdate,
-    current_proveedor: dict = Depends(get_current_proveedor)
+@app.post("/admin/proveedores/rechazar/{solicitud_id}", tags=["Administradores", "Proveedores"])
+def reject_supplier_application(
+    solicitud_id: int,
+    db: Session = Depends(get_db),
+    current_admin_user: Administrador = Depends(get_current_user_with_role("admin"))
 ):
-    """
-    Actualiza la información del perfil del proveedor autenticado.
-    """
-    conn = None
+    solicitud = db.query(models.SolicitudProveedor).filter(models.SolicitudProveedor.id == solicitud_id).first()
+    if not solicitud:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solicitud de proveedor no encontrada.")
+    if solicitud.estado != 'pendiente':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La solicitud ya no está pendiente.")
+
+    solicitud.estado = 'rechazado'
+    solicitud.contrasena_hash = None # Limpiar contraseña si se rechaza
+
     try:
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("No se pudo establecer conexión con la base de datos para actualización de perfil de proveedor.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error al conectar con la base de datos"
-            )
-
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-
-        update_fields = []
-        update_values = []
-
-        for field, value in proveedor_update.model_dump(exclude_unset=True).items():
-            update_fields.append(f"{field} = %s")
-            update_values.append(value)
-
-        if not update_fields:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No se proporcionaron datos para actualizar."
-            )
-
-        update_fields.append("ultima_sesion = %s")
-        update_values.append(datetime.utcnow())
-
-        update_values.append(current_proveedor["id"])
-
-        query = f"""
-            UPDATE proveedores
-            SET {", ".join(update_fields)}
-            WHERE id = %s
-            RETURNING *;
-        """
-
-        logger.debug(f"Ejecutando consulta de actualización de proveedor: {query} con valores: {update_values}")
-        cursor.execute(query, tuple(update_values))
-
-        updated_proveedor_data = cursor.fetchone()
-        conn.commit()
-        cursor.close()
-
-        if not updated_proveedor_data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Perfil de proveedor no encontrado o no se pudo actualizar."
-            )
-
-        logger.info(f"Perfil de proveedor {current_proveedor['id']} actualizado exitosamente.")
-        return updated_proveedor_data
-
-    except psycopg2.IntegrityError as e:
-        if conn: conn.rollback()
-        logger.error(f"Error de integridad al actualizar perfil de proveedor: {e}", exc_info=True)
-        if "email_contacto" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="El correo electrónico de contacto ya está registrado para otro proveedor."
-            )
-        if "rfc_empresa" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="El RFC de la empresa ya está registrado para otro proveedor."
-            )
-        if "nombre_legal_empresa" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="El nombre legal de la empresa ya está registrado para otro proveedor."
-            )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error al actualizar perfil: {e}"
-        )
-    except HTTPException as http_exc:
-        raise http_exc
+        db.add(solicitud)
+        db.commit()
+        db.refresh(solicitud)
+        return {"message": "Solicitud de proveedor rechazada."}
     except Exception as e:
-        if conn: conn.rollback()
-        logger.error(f"Error inesperado al actualizar perfil de proveedor: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor al actualizar el perfil: {e}"
-        )
-    finally:
-        if conn:
-            conn.close()
-
-
-## Endpoints del Chatbot
-
-
-@app.post("/chatbot/proveedor/ask")
-async def ask_chatbot_proveedor(
-    chat_message: ChatMessage, # <-- ¡Aquí se recibe el JSON con el campo 'message'!
-    current_proveedor: Dict[str, Any] = Depends(get_current_proveedor) # El decorador ya devuelve el diccionario completo del proveedor
-):
-    """
-    Endpoint para que los proveedores interactúen con el chatbot.
-    Recibe un mensaje de texto y devuelve una respuesta generada por el chatbot.
-    """
-    try:
-        # Extraemos el email del proveedor autenticado desde el diccionario 'current_proveedor'
-        proveedor_email = current_proveedor.get("email_contacto")
-        
-        if not proveedor_email:
-            logger.error(f"No se pudo obtener el email del proveedor desde el token para el chatbot. Proveedor_data: {current_proveedor}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No se pudo identificar tu cuenta de proveedor."
-            )
-
-        # Pasamos el texto del mensaje (chat_message.message) y el email del proveedor a la función del chatbot
-        response_text = responder_chatbot_proveedor(chat_message.message, proveedor_email)
-        
-        logger.info(f"Chatbot response for '{proveedor_email}': '{response_text}'")
-        return {"response": response_text}
-    except HTTPException as http_exc:
-        raise http_exc # Re-lanza las HTTPException directamente
-    except Exception as e:
-        logger.error(f"Error en el endpoint /chatbot/proveedor/ask: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor al procesar la solicitud del chatbot: {e}"
-        )
-
-# --- Endpoint para el análisis de contratos (ejemplo, necesita implementación) ---
-@app.post("/api/analyze-contract")
-async def analyze_contract(
-    contract_file: UploadFile = File(...),
-    language: str = Form("es"), # Opcional, si quieres especificar el idioma del contrato
-    current_proveedor: Dict[str, Any] = Depends(get_current_proveedor)
-):
-    """
-    Endpoint para que los proveedores suban un contrato y el chatbot lo analice.
-    """
-    if not contract_file.filename.endswith(('.pdf', '.doc', '.docx', '.txt')):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tipo de archivo no soportado. Por favor, sube PDF, DOC, DOCX o TXT."
-        )
-
-    # Aquí iría la lógica para leer y analizar el archivo.
-    # Por ejemplo, podrías leer el contenido:
-    # content = await contract_file.read()
-    # Y luego pasarlo a una función de análisis (similar a responder_chatbot_proveedor)
-    # analysis_results = perform_contract_analysis(content, language, current_proveedor.get("email_contacto"))
-
-    # Placeholder de respuesta (debes reemplazarlo con tu lógica real de análisis)
-    # El frontend espera una lista de objetos con 'clauseType', 'riskLevel', 'suggestion'
-    mock_analysis_results = [
-        {"clauseType": "Cláusula de Pago", "riskLevel": "Medio", "suggestion": "Revisar términos de pago y plazos de facturación."},
-        {"clauseType": "Cláusula de Terminación", "riskLevel": "Bajo", "suggestion": "Condiciones de terminación estándar, sin riesgos evidentes."},
-        {"clauseType": "Exclusión de Responsabilidad", "riskLevel": "Alto", "suggestion": "Esta cláusula limita severamente tus derechos. Consulta con un abogado."},
-        {"clauseType": "Jurisdicción y Ley Aplicable", "riskLevel": "Bajo", "suggestion": "Se establece la jurisdicción local, lo cual es favorable."},
-        {"clauseType": "Confidencialidad", "riskLevel": "Medio", "suggestion": "Asegúrate de entender qué información es confidencial y por cuánto tiempo."}
-    ]
-
-    logger.info(f"Análisis de contrato simulado para {current_proveedor.get('email_contacto')} - Archivo: {contract_file.filename}")
-    return mock_analysis_results
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al rechazar solicitud: {str(e)}")

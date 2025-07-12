@@ -8,7 +8,7 @@ __pycache__/
 # Ignorar archivos del sistema
 .DS_Store
 Thumbs.db
-
+clear
 # Ignorar archivos de Python compilados
 *.pyc
 *.pyo
@@ -20,3 +20,5 @@ node_modules/
 compra 
 compra/
 /compra
+
+.env
