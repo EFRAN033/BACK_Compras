@@ -761,3 +761,26 @@ async def get_all_categories(db: Session = Depends(get_db)):
     """
     categorias = db.query(models.Categoria).all()
     return categorias
+
+# main.py (Añade esto en una sección lógica, por ejemplo, junto a /categorias o en una nueva sección "Productos Públicos")
+
+@app.get("/productos", response_model=List[ProductoProveedorResponse], tags=["Productos Públicos"])
+async def get_all_products(
+    categoria_id: Optional[str] = None, # Permitir filtrar por categoría
+    db: Session = Depends(get_db)
+):
+    """
+    Obtiene una lista de todos los productos disponibles, opcionalmente filtrados por categoría.
+    """
+    query = db.query(models.ProductoProveedor).filter(models.ProductoProveedor.estado == 'Activo') # Solo productos 'Activo'
+    
+    if categoria_id:
+        query = query.filter(models.ProductoProveedor.categoria_id == categoria_id)
+        
+    products = query.all()
+    
+    # Procesar los precios_por_volumen para la respuesta (si son JSONB)
+    for product in products:
+        product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
+    
+    return products
