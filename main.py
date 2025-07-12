@@ -207,12 +207,12 @@ def get_current_user_with_role(required_role: str):
         return user
     return _get_current_user
 
+# --- Modelos Pydantic para Productos (definidos previamente, pero los incluyo para claridad) ---
 class ProductStatusEnum(str, Enum):
     activo = "Activo"
     inactivo = "Inactivo"
     borrador = "Borrador"
 
-# --- Enum para la unidad de medida (debe coincidir con tu DB) ---
 class UnitOfMeasureEnum(str, Enum):
     unidad = "Unidad"
     caja = "Caja"
@@ -222,23 +222,21 @@ class UnitOfMeasureEnum(str, Enum):
     docena = "Docena"
     bulto = "Bulto"
     palet = "Palet"
-    servicio = "Servicio" # Añadir si existe en tus datos de ejemplo
-    licencia = "Licencia" # Añadir si existe en tus datos de ejemplo
-    suscripcion = "Suscripción" # Añadir si existe en tus datos de ejemplo
+    servicio = "Servicio"
+    licencia = "Licencia"
+    suscripcion = "Suscripción"
 
-# --- Modelos para Precios por Volumen ---
 class PrecioPorVolumen(BaseModel):
     min_quantity: int
     max_quantity: Optional[int] = None
     price: Decimal
 
-# --- Modelo Base para Producto (para creación/actualización) ---
 class ProductoProveedorBase(BaseModel):
     nombre: str
     descripcion: Optional[str] = None
     precio: Decimal
     stock: int
-    categoria_id: str # Coincide con 'categoria_id' en tu DB
+    categoria_id: str
     image_url: Optional[str] = None
     sku: Optional[str] = None
     estado: ProductStatusEnum = ProductStatusEnum.borrador
@@ -250,15 +248,12 @@ class ProductoProveedorBase(BaseModel):
     dimension_ancho_cm: Optional[Decimal] = None
     dimension_alto_cm: Optional[Decimal] = None
     codigo_barras: Optional[str] = None
-    fecha_caducidad: Optional[date] = None # Usar date
+    fecha_caducidad: Optional[date] = None
     tiempo_procesamiento_dias: Optional[int] = None
 
-# --- Modelo para la creación de un producto (entrada) ---
 class ProductoProveedorCreate(ProductoProveedorBase):
-    # No necesita el ID ya que es auto-generado
     pass
 
-# --- Modelo para la actualización de un producto (entrada, campos opcionales) ---
 class ProductoProveedorUpdate(ProductoProveedorBase):
     nombre: Optional[str] = None
     precio: Optional[Decimal] = None
@@ -267,24 +262,28 @@ class ProductoProveedorUpdate(ProductoProveedorBase):
     estado: Optional[ProductStatusEnum] = None
     unidad_medida: Optional[UnitOfMeasureEnum] = None
     cantidad_minima_pedido: Optional[int] = None
-    # Los demás campos ya son Optional en ProductoProveedorBase
 
-# --- Modelo para la respuesta de un producto (salida, incluye ID y fechas) ---
 class ProductoProveedorResponse(ProductoProveedorBase):
     id: int
-    proveedor_id: int # Necesitamos el ID del proveedor al que pertenece
+    proveedor_id: int
     fecha_creacion: datetime
     fecha_actualizacion: datetime
-    # Para manejar los precios_por_volumen como lista de dicts si vienen de la DB
     precios_por_volumen: List[PrecioPorVolumen] = []
 
     class Config:
         from_attributes = True
         json_encoders = {
-            date: lambda v: v.isoformat() if v else None, # Formatear date a string ISO
-            datetime: lambda v: v.isoformat() if v else None, # Formatear datetime a string ISO
-            Decimal: lambda v: float(v) # Convertir Decimal a float para JSON
+            date: lambda v: v.isoformat() if v else None,
+            datetime: lambda v: v.isoformat() if v else None,
+            Decimal: lambda v: float(v)
         }
+# --- MODELO PYDANTIC para Categoría ---
+class CategoriaResponse(BaseModel):
+    id: str
+    nombre: str
+
+    class Config:
+        from_attributes = True
 
 # --- INSTANCIA Y CONFIGURACIÓN DE FASTAPI ---
 app = FastAPI(title="ProVeo API", version="1.0.0")
@@ -334,7 +333,9 @@ def update_user_me(user_update: ClienteUpdate, db: Session = Depends(get_db), cu
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El correo electrónico ya está en uso por otra cuenta.")
-    return db_cliente
+    # Fix: return the updated current_user, not db_cliente
+    return current_user 
+
 
 @app.post("/proveedores/registro", status_code=status.HTTP_201_CREATED, tags=["Proveedores"])
 def registrar_solicitud_proveedor(solicitud: SolicitudProveedorCreate, db: Session = Depends(get_db)):
@@ -397,6 +398,175 @@ def login_proveedor(form_data: LoginRequest, db: Session = Depends(get_db)):
         "user_role": "proveedor"
     }
 
+# --- INICIO DE ENDPOINTS DE GESTIÓN DE PRODUCTOS PARA PROVEEDORES ---
+# ESTE ES EL BLOQUE QUE FALTABA Y AHORA SE AGREGA
+@app.post("/proveedores/productos", response_model=ProductoProveedorResponse, status_code=status.HTTP_201_CREATED, tags=["Proveedores", "Productos"])
+async def create_product_for_supplier(
+    product: ProductoProveedorCreate,
+    db: Session = Depends(get_db),
+    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
+):
+    # Verificar si la categoría existe
+    categoria_exists = db.query(models.Categoria).filter(models.Categoria.id == product.categoria_id).first()
+    if not categoria_exists:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"La categoría '{product.categoria_id}' no existe."
+        )
+
+    # Convertir List[PrecioPorVolumen] a JSONB string
+    precios_por_volumen_json = json.dumps([p.dict() for p in product.precios_por_volumen]) if product.precios_por_volumen else "[]"
+
+
+    db_product = models.ProductoProveedor(
+        proveedor_id=current_supplier.id,
+        nombre=product.nombre,
+        descripcion=product.descripcion,
+        precio=product.precio,
+        stock=product.stock,
+        categoria_id=product.categoria_id,
+        image_url=product.image_url,
+        sku=product.sku,
+        estado=product.estado.value, # Asegurarse de guardar el valor del Enum
+        unidad_medida=product.unidad_medida.value, # Asegurarse de guardar el valor del Enum
+        cantidad_minima_pedido=product.cantidad_minima_pedido,
+        precios_por_volumen=precios_por_volumen_json, # Guardar como JSONB
+        peso_kg=product.peso_kg,
+        dimension_largo_cm=product.dimension_largo_cm,
+        dimension_ancho_cm=product.dimension_ancho_cm,
+        dimension_alto_cm=product.dimension_alto_cm,
+        codigo_barras=product.codigo_barras,
+        fecha_caducidad=product.fecha_caducidad,
+        tiempo_procesamiento_dias=product.tiempo_procesamiento_dias
+    )
+    
+    try:
+        db.add(db_product)
+        db.commit()
+        db.refresh(db_product)
+        # Convertir JSONB de vuelta a List[PrecioPorVolumen] para la respuesta
+        db_product.precios_por_volumen = json.loads(db_product.precios_por_volumen) if isinstance(db_product.precios_por_volumen, str) else db_product.precios_por_volumen
+        return db_product
+    except IntegrityError as e:
+        db.rollback()
+        if "sku" in str(e).lower():
+             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ya existe un producto con el SKU proporcionado.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error al crear el producto: {e.orig.pgerror}")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error inesperado al crear el producto: {str(e)}")
+
+@app.get("/proveedores/productos", response_model=List[ProductoProveedorResponse], tags=["Proveedores", "Productos"])
+async def get_supplier_products(
+    db: Session = Depends(get_db),
+    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
+):
+    products = db.query(models.ProductoProveedor).filter(
+        models.ProductoProveedor.proveedor_id == current_supplier.id
+    ).all()
+    
+    # Procesar los precios_por_volumen para la respuesta
+    for product in products:
+        product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
+    
+    return products
+
+@app.get("/proveedores/productos/{product_id}", response_model=ProductoProveedorResponse, tags=["Proveedores", "Productos"])
+async def get_supplier_product_by_id(
+    product_id: int,
+    db: Session = Depends(get_db),
+    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
+):
+    product = db.query(models.ProductoProveedor).filter(
+        models.ProductoProveedor.id == product_id,
+        models.ProductoProveedor.proveedor_id == current_supplier.id
+    ).first()
+    
+    if not product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado o no pertenece a este proveedor.")
+    
+    # Procesar los precios_por_volumen para la respuesta
+    product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
+    
+    return product
+
+@app.put("/proveedores/productos/{product_id}", response_model=ProductoProveedorResponse, tags=["Proveedores", "Productos"])
+async def update_supplier_product(
+    product_id: int,
+    product_update: ProductoProveedorUpdate,
+    db: Session = Depends(get_db),
+    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
+):
+    db_product = db.query(models.ProductoProveedor).filter(
+        models.ProductoProveedor.id == product_id,
+        models.ProductoProveedor.proveedor_id == current_supplier.id
+    ).first()
+
+    if not db_product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado o no pertenece a este proveedor.")
+
+    update_data = product_update.dict(exclude_unset=True)
+
+    # Si se actualiza la categoría, verificar que exista
+    if "categoria_id" in update_data:
+        categoria_exists = db.query(models.Categoria).filter(models.Categoria.id == update_data["categoria_id"]).first()
+        if not categoria_exists:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"La categoría '{update_data['categoria_id']}' no existe."
+            )
+
+    # Manejar precios_por_volumen si está en la actualización
+    if "precios_por_volumen" in update_data:
+        update_data["precios_por_volumen"] = json.dumps([p.dict() for p in update_data["precios_por_volumen"]])
+    
+    # Convertir Enums a sus valores de cadena si están presentes
+    if "estado" in update_data:
+        update_data["estado"] = update_data["estado"].value
+    if "unidad_medida" in update_data:
+        update_data["unidad_medida"] = update_data["unidad_medida"].value
+
+    for key, value in update_data.items():
+        setattr(db_product, key, value)
+    
+    try:
+        db.add(db_product)
+        db.commit()
+        db.refresh(db_product)
+        db_product.precios_por_volumen = json.loads(db_product.precios_por_volumen) if isinstance(db_product.precios_por_volumen, str) else db_product.precios_por_volumen
+        return db_product
+    except IntegrityError as e:
+        db.rollback()
+        if "sku" in str(e).lower():
+             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ya existe un producto con el SKU proporcionado.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error al actualizar el producto: {e.orig.pgerror}")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error inesperado al actualizar el producto: {str(e)}")
+
+@app.delete("/proveedores/productos/{product_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Proveedores", "Productos"])
+async def delete_supplier_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    current_supplier: models.SolicitudProveedor = Depends(get_current_user_with_role("proveedor"))
+):
+    db_product = db.query(models.ProductoProveedor).filter(
+        models.ProductoProveedor.id == product_id,
+        models.ProductoProveedor.proveedor_id == current_supplier.id
+    ).first()
+
+    if not db_product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado o no pertenece a este proveedor.")
+
+    try:
+        db.delete(db_product)
+        db.commit()
+        return {"message": "Producto eliminado con éxito."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al eliminar el producto: {str(e)}")
+
+# --- FIN DE ENDPOINTS DE GESTIÓN DE PRODUCTOS PARA PROVEEDORES ---
 
 @app.post("/admin/login", response_model=Token, tags=["Administradores"])
 def login_admin(form_data: AdminLoginRequest, db: Session = Depends(get_db)):
@@ -551,3 +721,11 @@ def reject_supplier_application(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al rechazar solicitud: {str(e)}")
+    
+@app.get("/categorias", response_model=List[CategoriaResponse], tags=["General"])
+async def get_all_categories(db: Session = Depends(get_db)):
+    """
+    Obtiene todas las categorías disponibles en el sistema.
+    """
+    categorias = db.query(models.Categoria).all()
+    return categorias
