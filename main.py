@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File # Added UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -14,16 +14,19 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import secrets
 from dotenv import load_dotenv
-# --- Enum para el estado del producto (debe coincidir con tu DB) ---
 from enum import Enum
 
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 from decimal import Decimal
-from datetime import date # Importar date para fecha_caducidad
-import json # Importar json para manejar JSONB
+from datetime import date
+import json
+
 import models
 from database import SessionLocal, engine
 from models import Administrador, SolicitudProveedor, Categoria, Cliente
+
+# NEW: Import StaticFiles for serving static files (like uploaded images)
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
@@ -207,7 +210,7 @@ def get_current_user_with_role(required_role: str):
         return user
     return _get_current_user
 
-# --- Modelos Pydantic para Productos (definidos previamente, pero los incluyo para claridad) ---
+# --- Modelos Pydantic para Productos ---
 class ProductStatusEnum(str, Enum):
     activo = "Activo"
     inactivo = "Inactivo"
@@ -277,7 +280,8 @@ class ProductoProveedorResponse(ProductoProveedorBase):
             datetime: lambda v: v.isoformat() if v else None,
             Decimal: lambda v: float(v)
         }
-# --- MODELO PYDANTIC para Categoría ---
+
+# --- MODELO PYDANTIC para Categoría (Respuesta) ---
 class CategoriaResponse(BaseModel):
     id: str
     nombre: str
@@ -287,6 +291,19 @@ class CategoriaResponse(BaseModel):
 
 # --- INSTANCIA Y CONFIGURACIÓN DE FASTAPI ---
 app = FastAPI(title="ProVeo API", version="1.0.0")
+
+# MONTAR EL DIRECTORIO ESTÁTICO PARA IMÁGENES
+# Asegúrate de que exista una carpeta 'static' en la raíz de tu proyecto backend
+# Y dentro de 'static', una carpeta 'images'.
+# Ejemplo de estructura:
+# tu_proyecto_backend/
+# ├── main.py
+# ├── models.py
+# ├── static/
+# │   └── images/
+# └── ...
+app.mount("/static", StaticFiles(directory="static"), name="static") # Added Static Files mounting
+
 origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -333,7 +350,6 @@ def update_user_me(user_update: ClienteUpdate, db: Session = Depends(get_db), cu
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El correo electrónico ya está en uso por otra cuenta.")
-    # Fix: return the updated current_user, not db_cliente
     return current_user 
 
 
@@ -394,12 +410,11 @@ def login_proveedor(form_data: LoginRequest, db: Session = Depends(get_db)):
     # Devuelve el token y el nombre del contacto del proveedor, incluyendo el rol
     return {
         "token": access_token,
-        "user_name": proveedor_db.nombre_contacto, # O el nombre de la empresa
+        "user_name": proveedor_db.nombre_contacto,
         "user_role": "proveedor"
     }
 
 # --- INICIO DE ENDPOINTS DE GESTIÓN DE PRODUCTOS PARA PROVEEDORES ---
-# ESTE ES EL BLOQUE QUE FALTABA Y AHORA SE AGREGA
 @app.post("/proveedores/productos", response_model=ProductoProveedorResponse, status_code=status.HTTP_201_CREATED, tags=["Proveedores", "Productos"])
 async def create_product_for_supplier(
     product: ProductoProveedorCreate,
@@ -427,10 +442,10 @@ async def create_product_for_supplier(
         categoria_id=product.categoria_id,
         image_url=product.image_url,
         sku=product.sku,
-        estado=product.estado.value, # Asegurarse de guardar el valor del Enum
-        unidad_medida=product.unidad_medida.value, # Asegurarse de guardar el valor del Enum
+        estado=product.estado.value,
+        unidad_medida=product.unidad_medida.value,
         cantidad_minima_pedido=product.cantidad_minima_pedido,
-        precios_por_volumen=precios_por_volumen_json, # Guardar como JSONB
+        precios_por_volumen=precios_por_volumen_json,
         peso_kg=product.peso_kg,
         dimension_largo_cm=product.dimension_largo_cm,
         dimension_ancho_cm=product.dimension_ancho_cm,
@@ -444,7 +459,6 @@ async def create_product_for_supplier(
         db.add(db_product)
         db.commit()
         db.refresh(db_product)
-        # Convertir JSONB de vuelta a List[PrecioPorVolumen] para la respuesta
         db_product.precios_por_volumen = json.loads(db_product.precios_por_volumen) if isinstance(db_product.precios_por_volumen, str) else db_product.precios_por_volumen
         return db_product
     except IntegrityError as e:
@@ -465,7 +479,6 @@ async def get_supplier_products(
         models.ProductoProveedor.proveedor_id == current_supplier.id
     ).all()
     
-    # Procesar los precios_por_volumen para la respuesta
     for product in products:
         product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
     
@@ -485,7 +498,6 @@ async def get_supplier_product_by_id(
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado o no pertenece a este proveedor.")
     
-    # Procesar los precios_por_volumen para la respuesta
     product.precios_por_volumen = json.loads(product.precios_por_volumen) if isinstance(product.precios_por_volumen, str) else product.precios_por_volumen
     
     return product
@@ -507,7 +519,6 @@ async def update_supplier_product(
 
     update_data = product_update.dict(exclude_unset=True)
 
-    # Si se actualiza la categoría, verificar que exista
     if "categoria_id" in update_data:
         categoria_exists = db.query(models.Categoria).filter(models.Categoria.id == update_data["categoria_id"]).first()
         if not categoria_exists:
@@ -516,11 +527,9 @@ async def update_supplier_product(
                 detail=f"La categoría '{update_data['categoria_id']}' no existe."
             )
 
-    # Manejar precios_por_volumen si está en la actualización
     if "precios_por_volumen" in update_data:
         update_data["precios_por_volumen"] = json.dumps([p.dict() for p in update_data["precios_por_volumen"]])
     
-    # Convertir Enums a sus valores de cadena si están presentes
     if "estado" in update_data:
         update_data["estado"] = update_data["estado"].value
     if "unidad_medida" in update_data:
@@ -567,6 +576,29 @@ async def delete_supplier_product(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al eliminar el producto: {str(e)}")
 
 # --- FIN DE ENDPOINTS DE GESTIÓN DE PRODUCTOS PARA PROVEEDORES ---
+
+# --- NUEVO ENDPOINT PARA SUBIR IMÁGENES ---
+@app.post("/upload-image", tags=["General", "Imágenes"])
+async def upload_image(file: UploadFile = File(...)):
+    """
+    Sube un archivo de imagen y lo guarda en el directorio estático.
+    Retorna la URL accesible de la imagen.
+    """
+    upload_dir = "static/images"
+    os.makedirs(upload_dir, exist_ok=True)
+
+    file_extension = file.filename.split(".")[-1]
+    unique_filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(8)}.{file_extension}"
+    file_location = os.path.join(upload_dir, unique_filename)
+
+    try:
+        with open(file_location, "wb+") as file_object:
+            file_object.write(await file.read())
+        
+        image_url = f"http://localhost:8000/static/images/{unique_filename}"
+        return {"imageUrl": image_url}
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al subir la imagen: {str(e)}")
 
 @app.post("/admin/login", response_model=Token, tags=["Administradores"])
 def login_admin(form_data: AdminLoginRequest, db: Session = Depends(get_db)):
