@@ -29,8 +29,7 @@ from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
-# Asegurarse de que las tablas existan (incluida Notificacion)
-models.Base.metadata.create_all(bind=engine)
+
 
 # --- CONFIGURACIÓN DE SEGURIDAD ---
 SECRET_KEY = os.getenv("SECRET_KEY", "tu_super_secreto_para_jwt_en_dev")
