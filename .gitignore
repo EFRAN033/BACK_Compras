@@ -1,0 +1,22 @@
+# Ignorar entorno virtual
+venv/
+__pycache__/
+
+# Ignorar bases de datos locales
+*.sqlite3
+
+# Ignorar archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Ignorar archivos de Python compilados
+*.pyc
+*.pyo
+
+# Ignorar logs
+*.log
+node_modules/
+
+compra 
+compra/
+/compra
