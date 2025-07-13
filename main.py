@@ -7,7 +7,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload # Mantener joinedload para productos, si lo necesitas
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -23,13 +23,14 @@ import json
 
 import models
 from database import SessionLocal, engine
-from models import Administrador, SolicitudProveedor, Categoria, Cliente, Notificacion # <-- Importar Notificacion
+from models import Administrador, SolicitudProveedor, Categoria, Cliente, Notificacion # <-- Importar Notificacion si existe en models.py
 
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
-
+# Asegurarse de que las tablas existan (incluida Notificacion si está en models.py)
+models.Base.metadata.create_all(bind=engine)
 
 # --- CONFIGURACIÓN DE SEGURIDAD ---
 SECRET_KEY = os.getenv("SECRET_KEY", "tu_super_secreto_para_jwt_en_dev")
@@ -309,6 +310,7 @@ class ProductoProveedorResponseDetallada(ProductoProveedorBase):
 # --- MODELO PYDANTIC para Categoría (Respuesta) ---
 class CategoriaResponse(BaseModel):
     id: str
+
     nombre: str
 
     class Config:
@@ -342,7 +344,7 @@ app = FastAPI(title="ProVeo API", version="1.0.0")
 # MONTAR EL DIRECTORIO ESTÁTICO PARA IMÁGENES
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-origins = ["http://localhost:5173", "http://127.0.0.1:5173", "https://d2hfbn520h36zj.cloudfront.net"]
+origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- RUTAS (ENDPOINTS) ---
