@@ -7,7 +7,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session, joinedload # Mantener joinedload para productos, si lo necesitas
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -23,11 +23,44 @@ import json
 
 import models
 from database import SessionLocal, engine
-from models import Administrador, SolicitudProveedor, Categoria, Cliente, Notificacion # <-- Importar Notificacion si existe en models.py
+from models import Administrador, SolicitudProveedor, Categoria, Cliente, Notificacion
 
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
+
+# --- INSTANCIA Y CONFIGURACIÓN DE FASTAPI ---
+app = FastAPI(title="ProVeo API", version="1.0.0")
+
+# MONTAR EL DIRECTORIO ESTÁTICO PARA IMÁGENES
+# Esto debe hacerse antes de que se manejen las solicitudes estáticas
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# --- CONFIGURACIÓN DE CORS ---
+# Obtén las URLs de frontend y backend de las variables de entorno de Render.
+# Debes añadir estas variables en el dashboard de Render de tu servicio backend.
+# Ejemplo en Render:
+# FRONTEND_URL = https://d1234abcd.cloudfront.net o https://www.tudominiofrontend.com
+# BACKEND_BASE_URL = https://back-compras.onrender.com
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173") # Valor por defecto para desarrollo
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:8000") # Para URLs de imágenes
+
+origins = [
+    FRONTEND_URL,
+    "http://localhost:5173", # Para tu entorno de desarrollo local (Vite default)
+    "http://127.0.0.1:5173", # Otra opción común para desarrollo local
+    # Si tienes más orígenes de frontend (ej. un dominio personalizado y el de CloudFront), añádelos aquí
+    # "https://tu-dominio-frontend-personalizado.com",
+    # "https://d1234abcd.cloudfront.net", # Tu URL de CloudFront, que debería venir de FRONTEND_URL
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"], # Esto incluye el método OPTIONS, crucial para preflight requests
+    allow_headers=["*"],
+)
 
 # Asegurarse de que las tablas existan (incluida Notificacion si está en models.py)
 models.Base.metadata.create_all(bind=engine)
@@ -338,22 +371,6 @@ class NotificacionResponse(BaseModel):
             datetime: lambda v: v.isoformat() if v else None,
         }
 
-# --- INSTANCIA Y CONFIGURACIÓN DE FASTAPI ---
-app = FastAPI(title="ProVeo API", version="1.0.0")
-
-# MONTAR EL DIRECTORIO ESTÁTICO PARA IMÁGENES
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173") # Valor por defecto para desarrollo
-
-origins = [
-    FRONTEND_URL,
-    "http://localhost:5173", # Para tu entorno de desarrollo local
-    "http://127.0.0.1:5173", # Otra opción común para desarrollo local
-    # Si tienes un segundo dominio de frontend, añádelo aquí
-    # "https://otro-dominio-de-tu-frontend.com",
-]
-
 # --- RUTAS (ENDPOINTS) ---
 
 @app.post("/afiliados/registro", response_model=Cliente, status_code=status.HTTP_201_CREATED, tags=["Clientes"])
@@ -612,7 +629,8 @@ async def upload_image(file: UploadFile = File(...)):
         with open(file_location, "wb+") as file_object:
             file_object.write(await file.read())
         
-        image_url = f"http://localhost:8000/static/images/{unique_filename}"
+        # Usa la variable de entorno BACKEND_BASE_URL
+        image_url = f"{BACKEND_BASE_URL}/static/images/{unique_filename}"
         return {"imageUrl": image_url}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al subir la imagen: {str(e)}")
