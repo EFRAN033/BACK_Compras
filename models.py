@@ -1,11 +1,11 @@
 # models.py
 
-from sqlalchemy import Column, Integer, String, Table, ForeignKey, DateTime, Text, Numeric, Date, Boolean # <--- Add Boolean here!
+from sqlalchemy import Column, Integer, String, Table, ForeignKey, DateTime, Text, Numeric, Date, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from sqlalchemy.dialects.postgresql import JSONB, ENUM 
+from sqlalchemy.dialects.postgresql import JSONB, ENUM # Import ENUM and JSONB
 
-import enum 
+import enum # Import Python's enum module
 
 from database import Base
 
@@ -27,6 +27,7 @@ class Administrador(Base):
     contrasena_hash = Column(String, nullable=False)
     nombre = Column(String, nullable=False)
     apellido = Column(String, nullable=False)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now(), nullable=False) # Agregada columna de la DB
 
 class Cliente(Base):
     __tablename__ = "clientes"
@@ -43,10 +44,16 @@ class Cliente(Base):
     tamano_empresa = Column(String)
     contrasena_hash = Column(String)
     fecha_registro = Column(DateTime(timezone=True), server_default=func.now())
-    aceptar_terminos = Column(Boolean, default=True) # This line now has Boolean imported
+    aceptar_terminos = Column(Boolean, default=True)
 
 
 # --- MODELOS PARA PROVEEDORES ---
+# Enum para el estado de la solicitud del proveedor (debe coincidir con el ENUM en PostgreSQL)
+class EstadoSolicitudEnum(enum.Enum):
+    pendiente = "pendiente"
+    aprobado = "aprobado"
+    rechazado = "rechazado"
+
 class SolicitudProveedor(Base):
     __tablename__ = "solicitudes_proveedores"
 
@@ -61,9 +68,9 @@ class SolicitudProveedor(Base):
     whatsapp = Column(String, nullable=True)
     capacidad_mensual = Column(String)
     tiempo_entrega = Column(String)
-    certificaciones = Column(String, nullable=True)
+    certificaciones = Column(Text, nullable=True) # Changed to Text based on \d output
     
-    estado = Column(String, default='pendiente') # 'pendiente', 'aprobado', 'rechazado'
+    estado = Column(ENUM(EstadoSolicitudEnum, name="estado_solicitud", create_type=False), nullable=False, default=EstadoSolicitudEnum.pendiente)
     contrasena_hash = Column(String, nullable=True)
     
     fecha_solicitud = Column(DateTime(timezone=True), server_default=func.now())
@@ -91,6 +98,7 @@ class Categoria(Base):
         secondary=solicitud_categoria_junction,
         back_populates="categorias_asociadas"
     )
+    productos = relationship("ProductoProveedor", back_populates="categoria") # Added back_populates for productos
 
 # --- Enums para el estado del producto (debe coincidir con tu DB) ---
 class ProductStatusEnumDB(enum.Enum):
@@ -145,7 +153,7 @@ class ProductoProveedor(Base):
 
     # Relaciones con otras tablas
     proveedor = relationship("SolicitudProveedor", back_populates="productos")
-    categoria = relationship("Categoria")
+    categoria = relationship("Categoria", back_populates="productos") # Added back_populates for categoria
 
 # AÑADIDO: Modelo para Notificaciones
 class Notificacion(Base):
