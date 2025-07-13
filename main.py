@@ -344,8 +344,15 @@ app = FastAPI(title="ProVeo API", version="1.0.0")
 # MONTAR EL DIRECTORIO ESTÁTICO PARA IMÁGENES
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173") # Valor por defecto para desarrollo
+
+origins = [
+    FRONTEND_URL,
+    "http://localhost:5173", # Para tu entorno de desarrollo local
+    "http://127.0.0.1:5173", # Otra opción común para desarrollo local
+    # Si tienes un segundo dominio de frontend, añádelo aquí
+    # "https://otro-dominio-de-tu-frontend.com",
+]
 
 # --- RUTAS (ENDPOINTS) ---
 
